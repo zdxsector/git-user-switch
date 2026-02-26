@@ -1,0 +1,412 @@
+#!/usr/bin/env bash
+#
+# git-user — CLI tool to switch between Git/GitHub user profiles
+#
+# Manages multiple git identities (personal, work, etc.) with:
+#   • Persistent config stored in ~/.git_user.conf
+#   • Automatic git global user.name / user.email switching
+#   • Automatic gh auth switching
+#   • Automatic git remote URL update for current repo
+#
+# Usage:
+#   git-user add <profile>          Add a new profile
+#   git-user remove <profile>       Remove a profile
+#   git-user list                   List all profiles
+#   git-user switch <profile>       Switch to a profile
+#   git-user current                Show active profile
+#   git-user edit <profile>         Edit an existing profile
+#   git-user help                   Show help
+
+set -euo pipefail
+
+CONF_FILE="${GIT_USER_CONF:-$HOME/.git_user.conf}"
+VERSION="1.0.0"
+
+# ─── Colors ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m' # No Color
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+info()    { echo -e "${BLUE}ℹ${NC}  $*"; }
+success() { echo -e "${GREEN}✔${NC}  $*"; }
+warn()    { echo -e "${YELLOW}⚠${NC}  $*"; }
+error()   { echo -e "${RED}✖${NC}  $*" >&2; }
+die()     { error "$@"; exit 1; }
+
+ensure_conf() {
+    if [[ ! -f "$CONF_FILE" ]]; then
+        cat > "$CONF_FILE" <<'EOF'
+# git-user configuration file
+# Format: profile.key=value
+# Keys: name, email, gh_user, ssh_key (optional), remote_host (optional)
+# Example:
+#   personal.name=John Doe
+#   personal.email=john@gmail.com
+#   personal.gh_user=johndoe
+#   personal.ssh_key=~/.ssh/id_ed25519_personal
+#   personal.remote_host=github.com
+#
+# Active profile is stored as:
+#   _active=personal
+EOF
+        info "Created config file at ${CYAN}$CONF_FILE${NC}"
+    fi
+}
+
+conf_get() {
+    # conf_get <key> — returns value or empty string
+    local key="$1"
+    grep -m1 "^${key}=" "$CONF_FILE" 2>/dev/null | cut -d'=' -f2- || true
+}
+
+conf_set() {
+    # conf_set <key> <value>
+    local key="$1" value="$2"
+    if grep -q "^${key}=" "$CONF_FILE" 2>/dev/null; then
+        # Use a different delimiter to avoid issues with paths
+        sed -i "s|^${key}=.*|${key}=${value}|" "$CONF_FILE"
+    else
+        echo "${key}=${value}" >> "$CONF_FILE"
+    fi
+}
+
+conf_delete_profile() {
+    local profile="$1"
+    sed -i "/^${profile}\./d" "$CONF_FILE"
+}
+
+profile_exists() {
+    grep -q "^${1}\." "$CONF_FILE" 2>/dev/null
+}
+
+list_profiles() {
+    grep -oP '^[a-zA-Z0-9_-]+(?=\.)' "$CONF_FILE" 2>/dev/null | sort -u
+}
+
+require_profile() {
+    local profile="$1"
+    if ! profile_exists "$profile"; then
+        die "Profile '${BOLD}$profile${NC}' not found. Run ${CYAN}git-user list${NC} to see available profiles."
+    fi
+}
+
+prompt_value() {
+    local prompt="$1" default="${2:-}"
+    local value
+    if [[ -n "$default" ]]; then
+        read -rp "$(echo -e "${BOLD}$prompt${NC} ${DIM}[$default]${NC}: ")" value
+        echo "${value:-$default}"
+    else
+        read -rp "$(echo -e "${BOLD}$prompt${NC}: ")" value
+        echo "$value"
+    fi
+}
+
+# ─── Commands ─────────────────────────────────────────────────────────────────
+
+cmd_add() {
+    local profile="${1:-}"
+    [[ -z "$profile" ]] && die "Usage: git-user add <profile-name>"
+
+    if profile_exists "$profile"; then
+        die "Profile '${BOLD}$profile${NC}' already exists. Use ${CYAN}git-user edit $profile${NC} to modify it."
+    fi
+
+    echo -e "\n${BOLD}Adding profile: ${CYAN}$profile${NC}\n"
+
+    local name email gh_user ssh_key remote_host
+
+    name=$(prompt_value "  Full name" "")
+    [[ -z "$name" ]] && die "Name is required."
+
+    email=$(prompt_value "  Email" "")
+    [[ -z "$email" ]] && die "Email is required."
+
+    gh_user=$(prompt_value "  GitHub username" "")
+    [[ -z "$gh_user" ]] && die "GitHub username is required."
+
+    ssh_key=$(prompt_value "  SSH key path (optional)" "")
+    remote_host=$(prompt_value "  Remote host (optional)" "github.com")
+
+    conf_set "${profile}.name" "$name"
+    conf_set "${profile}.email" "$email"
+    conf_set "${profile}.gh_user" "$gh_user"
+    [[ -n "$ssh_key" ]] && conf_set "${profile}.ssh_key" "$ssh_key"
+    conf_set "${profile}.remote_host" "${remote_host:-github.com}"
+
+    echo ""
+    success "Profile '${BOLD}$profile${NC}' added successfully!"
+    echo ""
+}
+
+cmd_edit() {
+    local profile="${1:-}"
+    [[ -z "$profile" ]] && die "Usage: git-user edit <profile-name>"
+    require_profile "$profile"
+
+    echo -e "\n${BOLD}Editing profile: ${CYAN}$profile${NC}\n"
+
+    local name email gh_user ssh_key remote_host
+
+    name=$(prompt_value "  Full name" "$(conf_get "${profile}.name")")
+    email=$(prompt_value "  Email" "$(conf_get "${profile}.email")")
+    gh_user=$(prompt_value "  GitHub username" "$(conf_get "${profile}.gh_user")")
+    ssh_key=$(prompt_value "  SSH key path" "$(conf_get "${profile}.ssh_key")")
+    remote_host=$(prompt_value "  Remote host" "$(conf_get "${profile}.remote_host")")
+
+    conf_set "${profile}.name" "$name"
+    conf_set "${profile}.email" "$email"
+    conf_set "${profile}.gh_user" "$gh_user"
+    [[ -n "$ssh_key" ]] && conf_set "${profile}.ssh_key" "$ssh_key"
+    conf_set "${profile}.remote_host" "${remote_host:-github.com}"
+
+    echo ""
+    success "Profile '${BOLD}$profile${NC}' updated!"
+    echo ""
+}
+
+cmd_remove() {
+    local profile="${1:-}"
+    [[ -z "$profile" ]] && die "Usage: git-user remove <profile-name>"
+    require_profile "$profile"
+
+    local active
+    active=$(conf_get "_active")
+
+    read -rp "$(echo -e "${YELLOW}Remove profile '${BOLD}$profile${NC}${YELLOW}'? [y/N]:${NC} ")" confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || { info "Cancelled."; return; }
+
+    conf_delete_profile "$profile"
+
+    if [[ "$active" == "$profile" ]]; then
+        sed -i '/^_active=/d' "$CONF_FILE"
+        warn "Removed active profile. No profile is currently active."
+    fi
+
+    success "Profile '${BOLD}$profile${NC}' removed."
+}
+
+cmd_list() {
+    local profiles active
+    active=$(conf_get "_active")
+    profiles=$(list_profiles)
+
+    if [[ -z "$profiles" ]]; then
+        warn "No profiles configured. Run ${CYAN}git-user add <name>${NC} to create one."
+        return
+    fi
+
+    echo -e "\n${BOLD}  Profiles${NC}  ${DIM}($CONF_FILE)${NC}\n"
+
+    while IFS= read -r p; do
+        local marker=" "
+        local color=""
+        if [[ "$p" == "$active" ]]; then
+            marker="●"
+            color="${GREEN}"
+        fi
+
+        local name email gh_user
+        name=$(conf_get "${p}.name")
+        email=$(conf_get "${p}.email")
+        gh_user=$(conf_get "${p}.gh_user")
+
+        if [[ "$p" == "$active" ]]; then
+            echo -e "  ${GREEN}${marker}${NC} ${GREEN}${BOLD}${p}${NC}  ${DIM}${name} <${email}> @${gh_user}${NC}"
+        else
+            echo -e "  ${DIM}${marker}${NC} ${BOLD}${p}${NC}  ${DIM}${name} <${email}> @${gh_user}${NC}"
+        fi
+    done <<< "$profiles"
+
+    echo ""
+}
+
+cmd_current() {
+    local active
+    active=$(conf_get "_active")
+
+    if [[ -z "$active" ]]; then
+        warn "No active profile. Run ${CYAN}git-user switch <profile>${NC}."
+        echo ""
+        echo -e "  ${DIM}Current git config:${NC}"
+        echo -e "  ${DIM}  user.name  = $(git config --global user.name 2>/dev/null || echo '(not set)')${NC}"
+        echo -e "  ${DIM}  user.email = $(git config --global user.email 2>/dev/null || echo '(not set)')${NC}"
+        echo ""
+        return
+    fi
+
+    local name email gh_user
+    name=$(conf_get "${active}.name")
+    email=$(conf_get "${active}.email")
+    gh_user=$(conf_get "${active}.gh_user")
+
+    echo -e "\n  ${GREEN}●${NC} Active profile: ${GREEN}${BOLD}$active${NC}"
+    echo -e "    Name:     $name"
+    echo -e "    Email:    $email"
+    echo -e "    GitHub:   @$gh_user"
+    echo ""
+}
+
+cmd_switch() {
+    local profile="${1:-}"
+    [[ -z "$profile" ]] && die "Usage: git-user switch <profile-name>"
+    require_profile "$profile"
+
+    local name email gh_user ssh_key remote_host
+    name=$(conf_get "${profile}.name")
+    email=$(conf_get "${profile}.email")
+    gh_user=$(conf_get "${profile}.gh_user")
+    ssh_key=$(conf_get "${profile}.ssh_key")
+    remote_host=$(conf_get "${profile}.remote_host")
+    remote_host="${remote_host:-github.com}"
+
+    echo -e "\n${BOLD}Switching to profile: ${CYAN}$profile${NC}\n"
+
+    # 1) Git global config
+    echo -e "  ${DIM}Setting git config...${NC}"
+    git config --global user.name "$name"
+    git config --global user.email "$email"
+    success "git config → ${BOLD}$name${NC} <${email}>"
+
+    # 2) GitHub CLI auth switch
+    if command -v gh &>/dev/null; then
+        echo -e "  ${DIM}Switching gh auth...${NC}"
+        # Check if user is already logged in on gh
+        local current_gh_user
+        current_gh_user=$(gh api user --jq '.login' 2>/dev/null || true)
+
+        if [[ "$current_gh_user" == "$gh_user" ]]; then
+            success "gh auth → already logged in as ${BOLD}@$gh_user${NC}"
+        else
+            # Try to switch to an existing auth token
+            if gh auth switch --user "$gh_user" --hostname "$remote_host" 2>/dev/null; then
+                success "gh auth → switched to ${BOLD}@$gh_user${NC}"
+            else
+                warn "gh auth: user @$gh_user not found. Starting login..."
+                echo -e "  ${DIM}Run: gh auth login --hostname $remote_host${NC}"
+                gh auth login --hostname "$remote_host" || warn "gh auth login was skipped or failed."
+            fi
+        fi
+    else
+        warn "gh CLI not found — skipping GitHub auth switch."
+    fi
+
+    # 3) Update remote for current repo
+    if git rev-parse --is-inside-work-tree &>/dev/null; then
+        echo -e "  ${DIM}Updating remote URL...${NC}"
+        local current_remote repo_path new_url
+
+        current_remote=$(git remote get-url origin 2>/dev/null || true)
+
+        if [[ -n "$current_remote" ]]; then
+            # Extract repo path (owner/repo) from various URL formats
+            repo_path=$(echo "$current_remote" | sed -E 's#(https?://[^/]+/|git@[^:]+:)##' | sed 's/\.git$//')
+
+            if [[ -n "$repo_path" ]]; then
+                # Determine URL format based on ssh_key presence
+                if [[ -n "$ssh_key" ]]; then
+                    # Use SSH with potentially custom host alias
+                    new_url="git@${remote_host}:${gh_user}/${repo_path##*/}.git"
+                else
+                    new_url="https://${remote_host}/${gh_user}/${repo_path##*/}.git"
+                fi
+
+                # Only update if the owner part changed
+                local current_owner new_owner
+                current_owner=$(echo "$repo_path" | cut -d'/' -f1)
+                new_owner="$gh_user"
+
+                if [[ "$current_owner" != "$new_owner" ]]; then
+                    git remote set-url origin "$new_url"
+                    success "remote origin → ${BOLD}$new_url${NC}"
+                else
+                    success "remote origin → already correct (${DIM}$current_remote${NC})"
+                fi
+            fi
+        else
+            info "No 'origin' remote found — skipping remote update."
+        fi
+    else
+        info "Not inside a git repo — skipping remote update."
+    fi
+
+    # 4) SSH key (optional — set GIT_SSH_COMMAND)
+    if [[ -n "$ssh_key" ]]; then
+        local expanded_key="${ssh_key/#\~/$HOME}"
+        if [[ -f "$expanded_key" ]]; then
+            git config --global core.sshCommand "ssh -i $expanded_key -o IdentitiesOnly=yes"
+            success "SSH key → ${BOLD}$ssh_key${NC}"
+        else
+            warn "SSH key not found at $ssh_key — skipping."
+        fi
+    fi
+
+    # 5) Save active profile
+    conf_set "_active" "$profile"
+
+    echo -e "\n${GREEN}${BOLD}  ✔ Switched to '$profile'${NC}\n"
+}
+
+cmd_help() {
+    cat <<EOF
+
+$(echo -e "${BOLD}git-user${NC} v${VERSION} — Manage multiple Git/GitHub identities")
+
+$(echo -e "${BOLD}USAGE${NC}")
+    git-user <command> [arguments]
+
+$(echo -e "${BOLD}COMMANDS${NC}")
+    add <profile>       Create a new profile (name, email, gh user, ssh key)
+    remove <profile>    Delete a profile
+    edit <profile>      Modify an existing profile
+    list                Show all profiles (● = active)
+    switch <profile>    Activate a profile:
+                          • Sets git global user.name & user.email
+                          • Switches gh CLI auth
+                          • Updates current repo's remote URL
+                          • Configures SSH key (if set)
+    current             Show the active profile
+    help                Show this help message
+
+$(echo -e "${BOLD}CONFIG${NC}")
+    Profiles stored in: ${CONF_FILE}
+    Override with:      GIT_USER_CONF=/path/to/file git-user ...
+
+$(echo -e "${BOLD}EXAMPLES${NC}")
+    git-user add personal
+    git-user add work
+    git-user switch personal
+    git-user list
+
+EOF
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+main() {
+    ensure_conf
+
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        add)      cmd_add "$@" ;;
+        remove|rm|delete) cmd_remove "$@" ;;
+        edit)     cmd_edit "$@" ;;
+        list|ls)  cmd_list "$@" ;;
+        switch|use|set) cmd_switch "$@" ;;
+        current|who|status) cmd_current "$@" ;;
+        help|--help|-h) cmd_help ;;
+        version|--version|-v) echo "git-user v${VERSION}" ;;
+        *)        die "Unknown command: $cmd. Run ${CYAN}git-user help${NC} for usage." ;;
+    esac
+}
+
+main "$@"
