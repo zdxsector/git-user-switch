@@ -67,11 +67,13 @@ conf_get() {
 }
 
 conf_set() {
-    # conf_set <key> <value>
+    # conf_set <key> <value> — portable across macOS (BSD sed) and Linux (GNU sed)
     local key="$1" value="$2"
     if grep -q "^${key}=" "$CONF_FILE" 2>/dev/null; then
-        # Use a different delimiter to avoid issues with paths
-        sed -i "s|^${key}=.*|${key}=${value}|" "$CONF_FILE"
+        local tmpfile
+        tmpfile=$(mktemp)
+        awk -v k="$key" -v v="$value" 'BEGIN{FS=OFS="="} $1==k{$0=k"="v} {print}' "$CONF_FILE" > "$tmpfile"
+        mv "$tmpfile" "$CONF_FILE"
     else
         echo "${key}=${value}" >> "$CONF_FILE"
     fi
@@ -79,7 +81,10 @@ conf_set() {
 
 conf_delete_profile() {
     local profile="$1"
-    sed -i "/^${profile}\./d" "$CONF_FILE"
+    local tmpfile
+    tmpfile=$(mktemp)
+    grep -v "^${profile}\." "$CONF_FILE" > "$tmpfile" || true
+    mv "$tmpfile" "$CONF_FILE"
 }
 
 profile_exists() {
@@ -186,7 +191,10 @@ cmd_remove() {
     conf_delete_profile "$profile"
 
     if [[ "$active" == "$profile" ]]; then
-        sed -i '/^_active=/d' "$CONF_FILE"
+        local tmpfile
+        tmpfile=$(mktemp)
+        grep -v "^_active=" "$CONF_FILE" > "$tmpfile" || true
+        mv "$tmpfile" "$CONF_FILE"
         warn "Removed active profile. No profile is currently active."
     fi
 
