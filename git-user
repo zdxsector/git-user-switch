@@ -92,7 +92,7 @@ profile_exists() {
 }
 
 list_profiles() {
-    grep -oP '^[a-zA-Z0-9_-]+(?=\.)' "$CONF_FILE" 2>/dev/null | sort -u
+    sed -n 's/^\([a-zA-Z0-9_-]*\)\..*/\1/p' "$CONF_FILE" 2>/dev/null | sort -u
 }
 
 require_profile() {
