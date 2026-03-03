@@ -242,12 +242,50 @@ upsert_ssh_alias() {
         echo "Host $alias_name"
         echo "  HostName $remote_host"
         echo "  User git"
+        if should_add_keys_to_agent; then
+            echo "  AddKeysToAgent yes"
+        fi
+        if should_use_keychain_directive; then
+            echo "  UseKeychain yes"
+        fi
         echo "  IdentityFile $expanded_key"
         echo "  IdentitiesOnly yes"
         echo "$end_marker"
     } >> "$SSH_CONFIG_FILE"
 
     printf '%s\n' "$alias_name"
+}
+
+should_add_keys_to_agent() {
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        Darwin|MINGW*|MSYS*|CYGWIN*)
+            return 0
+            ;;
+    esac
+
+    case "${GIT_USER_SSH_USE_KEYCHAIN:-}" in
+        1|true|TRUE|yes|YES)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+should_use_keychain_directive() {
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        Darwin)
+            return 0
+            ;;
+    esac
+
+    case "${GIT_USER_SSH_USE_KEYCHAIN:-}" in
+        1|true|TRUE|yes|YES)
+            return 0
+            ;;
+    esac
+
+    return 1
 }
 
 clear_managed_git_ssh_aliases() {

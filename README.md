@@ -130,6 +130,13 @@ export GIT_USER_SSH_CONFIG="$HOME/.config/ssh/git-user-config"
 git-user switch personal
 ```
 
+Force keychain-style SSH directives for managed aliases with `GIT_USER_SSH_USE_KEYCHAIN=1`:
+
+```bash
+export GIT_USER_SSH_USE_KEYCHAIN=1
+git-user switch personal
+```
+
 ## Examples
 
 ### Setting Up Personal + Work Profiles
@@ -198,6 +205,7 @@ $ git-user add enterprise
 
 - **Shell alias** — Add `alias gu="git-user"` to your `.bashrc`/`.zshrc` for faster switching.
 - **Multiple SSH keys** — Each profile can point to a different SSH key. `switch` manages per-profile SSH host aliases in `~/.ssh/config` and updates Git's global `url.*.insteadOf` rules so standard GitHub SSH remotes follow the active profile.
+- **Passphrase caching** — On macOS, managed SSH aliases include `AddKeysToAgent yes` and `UseKeychain yes` so switched keys can be cached. Set `GIT_USER_SSH_USE_KEYCHAIN=1` to force those directives in environments that support them.
 - **Edit the config directly** — The `.git_user.conf` file is human-readable; feel free to edit it by hand.
 
 ## License
