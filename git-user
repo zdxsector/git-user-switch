@@ -6,7 +6,6 @@
 #   • Persistent config stored in ~/.git_user.conf
 #   • Automatic git global user.name / user.email switching
 #   • Automatic gh auth switching
-#   • Automatic git remote URL update for current repo
 #
 # Usage:
 #   git-user add <profile>          Add a new profile
@@ -20,7 +19,8 @@
 set -euo pipefail
 
 CONF_FILE="${GIT_USER_CONF:-$HOME/.git_user.conf}"
-VERSION="1.0.0"
+SSH_CONFIG_FILE="${GIT_USER_SSH_CONFIG:-$HOME/.ssh/config}"
+VERSION="1.1.0"
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -45,11 +45,12 @@ ensure_conf() {
         cat > "$CONF_FILE" <<'EOF'
 # git-user configuration file
 # Format: profile.key=value
-# Keys: name, email, gh_user, ssh_key (optional), remote_host (optional)
+# Keys: name, email, gh_user, org_name (optional), ssh_key (optional), remote_host (optional)
 # Example:
 #   personal.name=John Doe
 #   personal.email=john@gmail.com
 #   personal.gh_user=johndoe
+#   personal.org_name=johndoe
 #   personal.ssh_key=~/.ssh/id_ed25519_personal
 #   personal.remote_host=github.com
 #
@@ -102,6 +103,175 @@ require_profile() {
     fi
 }
 
+extract_remote_owner() {
+    local remote_url="${1:-}"
+    local repo_path=""
+
+    case "$remote_url" in
+        git@*:* )
+            repo_path="${remote_url#*:}"
+            ;;
+        ssh://git@*/* )
+            repo_path="${remote_url#ssh://git@*/}"
+            ;;
+        https://*/* )
+            repo_path="${remote_url#https://*/}"
+            ;;
+    esac
+
+    repo_path="${repo_path%.git}"
+    if [[ "$repo_path" == */* ]]; then
+        printf '%s\n' "${repo_path%%/*}"
+    fi
+}
+
+profile_for_gh_user() {
+    local target_gh_user="$1"
+    local profile profile_gh_user
+
+    while IFS= read -r profile; do
+        [[ -n "$profile" ]] || continue
+        profile_gh_user=$(conf_get "${profile}.gh_user")
+        if [[ "$profile_gh_user" == "$target_gh_user" ]]; then
+            printf '%s\n' "$profile"
+            return 0
+        fi
+    done < <(list_profiles)
+
+    return 1
+}
+
+profile_target_owner() {
+    local profile="$1"
+    local owner gh_user
+    owner=$(conf_get "${profile}.org_name")
+    gh_user=$(conf_get "${profile}.gh_user")
+    printf '%s\n' "${owner:-$gh_user}"
+}
+
+sanitize_alias_part() {
+    local value="${1:-}"
+    value=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+    value=$(printf '%s' "$value" | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-+/-/g')
+    printf '%s\n' "${value:-default}"
+}
+
+ssh_alias_name() {
+    local profile="$1" remote_host="$2"
+    printf 'git-user-%s-%s\n' "$(sanitize_alias_part "$profile")" "$(sanitize_alias_part "$remote_host")"
+}
+
+extract_remote_path() {
+    local remote_url="${1:-}"
+    local repo_path=""
+
+    case "$remote_url" in
+        git@*:* )
+            repo_path="${remote_url#*:}"
+            ;;
+        ssh://git@*/* )
+            repo_path="${remote_url#ssh://git@*/}"
+            ;;
+        https://*/* )
+            repo_path="${remote_url#https://*/}"
+            ;;
+    esac
+
+    repo_path="${repo_path%.git}"
+    printf '%s\n' "$repo_path"
+}
+
+build_remote_url() {
+    local current_remote="$1" remote_host="$2" target_owner="$3" repo_name="$4"
+
+    case "$current_remote" in
+        https://* )
+            printf 'https://%s/%s/%s.git\n' "$remote_host" "$target_owner" "$repo_name"
+            ;;
+        ssh://git@* )
+            printf 'ssh://git@%s/%s/%s.git\n' "$remote_host" "$target_owner" "$repo_name"
+            ;;
+        * )
+            printf 'git@%s:%s/%s.git\n' "$remote_host" "$target_owner" "$repo_name"
+            ;;
+    esac
+}
+
+ensure_ssh_config_file() {
+    local ssh_dir
+    ssh_dir=$(dirname "$SSH_CONFIG_FILE")
+    mkdir -p "$ssh_dir"
+    chmod 700 "$ssh_dir" 2>/dev/null || true
+    touch "$SSH_CONFIG_FILE"
+    chmod 600 "$SSH_CONFIG_FILE" 2>/dev/null || true
+}
+
+remove_ssh_alias_block() {
+    local profile="$1" remote_host="$2"
+    local start_marker="# >>> git-user profile:${profile} host:${remote_host} >>>"
+    local end_marker="# <<< git-user profile:${profile} host:${remote_host} <<<"
+    local tmpfile
+
+    [[ -f "$SSH_CONFIG_FILE" ]] || return 0
+
+    tmpfile=$(mktemp)
+    awk -v start="$start_marker" -v end="$end_marker" '
+        $0 == start { skip = 1; next }
+        $0 == end { skip = 0; next }
+        !skip { print }
+    ' "$SSH_CONFIG_FILE" > "$tmpfile"
+    mv "$tmpfile" "$SSH_CONFIG_FILE"
+}
+
+upsert_ssh_alias() {
+    local profile="$1" remote_host="$2" ssh_key="$3"
+    local expanded_key="${ssh_key/#\~/$HOME}"
+    local alias_name start_marker end_marker
+
+    [[ -f "$expanded_key" ]] || return 1
+
+    alias_name=$(ssh_alias_name "$profile" "$remote_host")
+    start_marker="# >>> git-user profile:${profile} host:${remote_host} >>>"
+    end_marker="# <<< git-user profile:${profile} host:${remote_host} <<<"
+
+    ensure_ssh_config_file
+    remove_ssh_alias_block "$profile" "$remote_host"
+
+    {
+        echo "$start_marker"
+        echo "Host $alias_name"
+        echo "  HostName $remote_host"
+        echo "  User git"
+        echo "  IdentityFile $expanded_key"
+        echo "  IdentitiesOnly yes"
+        echo "$end_marker"
+    } >> "$SSH_CONFIG_FILE"
+
+    printf '%s\n' "$alias_name"
+}
+
+clear_managed_git_ssh_aliases() {
+    local profile remote_host alias_name
+
+    while IFS= read -r profile; do
+        [[ -n "$profile" ]] || continue
+        remote_host=$(conf_get "${profile}.remote_host")
+        remote_host="${remote_host:-github.com}"
+        alias_name=$(ssh_alias_name "$profile" "$remote_host")
+
+        git config --global --remove-section "url.git@${alias_name}:" 2>/dev/null || true
+        git config --global --remove-section "url.ssh://git@${alias_name}/" 2>/dev/null || true
+    done < <(list_profiles)
+}
+
+activate_git_ssh_alias() {
+    local alias_name="$1" remote_host="$2"
+
+    clear_managed_git_ssh_aliases
+    git config --global url."git@${alias_name}:".insteadOf "git@${remote_host}:"
+    git config --global url."ssh://git@${alias_name}/".insteadOf "ssh://git@${remote_host}/"
+}
+
 prompt_value() {
     local prompt="$1" default="${2:-}"
     local value
@@ -126,7 +296,7 @@ cmd_add() {
 
     echo -e "\n${BOLD}Adding profile: ${CYAN}$profile${NC}\n"
 
-    local name email gh_user ssh_key remote_host
+    local name email gh_user org_name ssh_key remote_host
 
     name=$(prompt_value "  Full name" "")
     [[ -z "$name" ]] && die "Name is required."
@@ -137,12 +307,14 @@ cmd_add() {
     gh_user=$(prompt_value "  GitHub username" "")
     [[ -z "$gh_user" ]] && die "GitHub username is required."
 
+    org_name=$(prompt_value "  Org name / repo owner" "$gh_user")
     ssh_key=$(prompt_value "  SSH key path (optional)" "")
     remote_host=$(prompt_value "  Remote host (optional)" "github.com")
 
     conf_set "${profile}.name" "$name"
     conf_set "${profile}.email" "$email"
     conf_set "${profile}.gh_user" "$gh_user"
+    conf_set "${profile}.org_name" "${org_name:-$gh_user}"
     [[ -n "$ssh_key" ]] && conf_set "${profile}.ssh_key" "$ssh_key"
     conf_set "${profile}.remote_host" "${remote_host:-github.com}"
 
@@ -158,17 +330,19 @@ cmd_edit() {
 
     echo -e "\n${BOLD}Editing profile: ${CYAN}$profile${NC}\n"
 
-    local name email gh_user ssh_key remote_host
+    local name email gh_user org_name ssh_key remote_host
 
     name=$(prompt_value "  Full name" "$(conf_get "${profile}.name")")
     email=$(prompt_value "  Email" "$(conf_get "${profile}.email")")
     gh_user=$(prompt_value "  GitHub username" "$(conf_get "${profile}.gh_user")")
+    org_name=$(prompt_value "  Org name / repo owner" "$(profile_target_owner "$profile")")
     ssh_key=$(prompt_value "  SSH key path" "$(conf_get "${profile}.ssh_key")")
     remote_host=$(prompt_value "  Remote host" "$(conf_get "${profile}.remote_host")")
 
     conf_set "${profile}.name" "$name"
     conf_set "${profile}.email" "$email"
     conf_set "${profile}.gh_user" "$gh_user"
+    conf_set "${profile}.org_name" "${org_name:-$gh_user}"
     [[ -n "$ssh_key" ]] && conf_set "${profile}.ssh_key" "$ssh_key"
     conf_set "${profile}.remote_host" "${remote_host:-github.com}"
 
@@ -188,13 +362,20 @@ cmd_remove() {
     read -rp "$(echo -e "${YELLOW}Remove profile '${BOLD}$profile${NC}${YELLOW}'? [y/N]:${NC} ")" confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || { info "Cancelled."; return; }
 
+    local remote_host
+    remote_host=$(conf_get "${profile}.remote_host")
+    remote_host="${remote_host:-github.com}"
+
     conf_delete_profile "$profile"
+    remove_ssh_alias_block "$profile" "$remote_host"
 
     if [[ "$active" == "$profile" ]]; then
         local tmpfile
         tmpfile=$(mktemp)
         grep -v "^_active=" "$CONF_FILE" > "$tmpfile" || true
         mv "$tmpfile" "$CONF_FILE"
+        clear_managed_git_ssh_aliases
+        git config --global --unset core.sshCommand 2>/dev/null || true
         warn "Removed active profile. No profile is currently active."
     fi
 
@@ -267,10 +448,11 @@ cmd_switch() {
     [[ -z "$profile" ]] && die "Usage: git-user switch <profile-name>"
     require_profile "$profile"
 
-    local name email gh_user ssh_key remote_host
+    local name email gh_user target_owner ssh_key remote_host
     name=$(conf_get "${profile}.name")
     email=$(conf_get "${profile}.email")
     gh_user=$(conf_get "${profile}.gh_user")
+    target_owner=$(profile_target_owner "$profile")
     ssh_key=$(conf_get "${profile}.ssh_key")
     remote_host=$(conf_get "${profile}.remote_host")
     remote_host="${remote_host:-github.com}"
@@ -288,14 +470,19 @@ cmd_switch() {
         echo -e "  ${DIM}Switching gh auth...${NC}"
         # Check if user is already logged in on gh
         local current_gh_user
-        current_gh_user=$(gh api user --jq '.login' 2>/dev/null || true)
+        current_gh_user=$(gh api --hostname "$remote_host" user --jq '.login' 2>/dev/null || true)
 
         if [[ "$current_gh_user" == "$gh_user" ]]; then
             success "gh auth → already logged in as ${BOLD}@$gh_user${NC}"
         else
             # Try to switch to an existing auth token
             if gh auth switch --user "$gh_user" --hostname "$remote_host" 2>/dev/null; then
-                success "gh auth → switched to ${BOLD}@$gh_user${NC}"
+                current_gh_user=$(gh api --hostname "$remote_host" user --jq '.login' 2>/dev/null || true)
+                if [[ "$current_gh_user" == "$gh_user" ]]; then
+                    success "gh auth → switched to ${BOLD}@$gh_user${NC}"
+                else
+                    warn "gh auth → selected @$gh_user, but the token could not be verified. Run ${CYAN}gh auth login --hostname $remote_host${NC} if HTTPS git fails."
+                fi
             else
                 warn "gh auth: user @$gh_user not found. Starting login..."
                 echo -e "  ${DIM}Run: gh auth login --hostname $remote_host${NC}"
@@ -306,53 +493,57 @@ cmd_switch() {
         warn "gh CLI not found — skipping GitHub auth switch."
     fi
 
-    # 3) Update remote for current repo
-    if git rev-parse --is-inside-work-tree &>/dev/null; then
-        echo -e "  ${DIM}Updating remote URL...${NC}"
-        local current_remote repo_path new_url
+    # 3) SSH key / SSH alias
+    if [[ -n "$ssh_key" ]]; then
+        local alias_name
+        alias_name=$(upsert_ssh_alias "$profile" "$remote_host" "$ssh_key" || true)
 
-        current_remote=$(git remote get-url origin 2>/dev/null || true)
+        if [[ -n "$alias_name" ]]; then
+            activate_git_ssh_alias "$alias_name" "$remote_host"
+            git config --global --unset core.sshCommand 2>/dev/null || true
+            success "SSH alias → ${BOLD}$alias_name${NC} (${DIM}$ssh_key${NC})"
+        else
+            warn "SSH key not found at $ssh_key — skipping."
+        fi
+    else
+        clear_managed_git_ssh_aliases
+        git config --global --unset core.sshCommand 2>/dev/null || true
+        info "SSH alias → cleared managed git SSH routing"
+    fi
+
+    # 4) Update remote owner for current repo
+    if git rev-parse --is-inside-work-tree &>/dev/null; then
+        local current_remote repo_path repo_name current_owner owner_profile new_remote
+        current_remote=$(git config --get remote.origin.url 2>/dev/null || true)
+        repo_path=$(extract_remote_path "$current_remote")
+        current_owner=$(extract_remote_owner "$current_remote")
+        owner_profile=$(profile_for_gh_user "$current_owner" || true)
 
         if [[ -n "$current_remote" ]]; then
-            # Extract repo path (owner/repo) from various URL formats
-            repo_path=$(echo "$current_remote" | sed -E 's#(https?://[^/]+/|git@[^:]+:)##' | sed 's/\.git$//')
+            repo_name="${repo_path##*/}"
 
-            if [[ -n "$repo_path" ]]; then
-                # Determine URL format based on ssh_key presence
-                if [[ -n "$ssh_key" ]]; then
-                    # Use SSH with potentially custom host alias
-                    new_url="git@${remote_host}:${gh_user}/${repo_path##*/}.git"
+            if [[ -n "$repo_name" ]]; then
+                new_remote=$(build_remote_url "$current_remote" "$remote_host" "$target_owner" "$repo_name")
+
+                if [[ "$current_remote" != "$new_remote" ]]; then
+                    git remote set-url origin "$new_remote"
+                    success "remote origin → ${BOLD}$new_remote${NC}"
+                    current_owner="$target_owner"
+                    owner_profile=$(profile_for_gh_user "$current_owner" || true)
                 else
-                    new_url="https://${remote_host}/${gh_user}/${repo_path##*/}.git"
+                    info "remote origin → already using ${BOLD}${target_owner}/${repo_name}${NC}"
                 fi
+            fi
 
-                # Only update if the owner part changed
-                local current_owner new_owner
-                current_owner=$(echo "$repo_path" | cut -d'/' -f1)
-                new_owner="$gh_user"
+            if [[ "$current_remote" == git@* || "$current_remote" == ssh://git@* ]]; then
+                info "Repo remote uses SSH, so git push/pull will use the active git-user SSH alias."
+            fi
 
-                if [[ "$current_owner" != "$new_owner" ]]; then
-                    git remote set-url origin "$new_url"
-                    success "remote origin → ${BOLD}$new_url${NC}"
-                else
-                    success "remote origin → already correct (${DIM}$current_remote${NC})"
-                fi
+            if [[ -n "$owner_profile" && "$owner_profile" != "$profile" ]]; then
+                warn "origin owner maps to configured profile ${BOLD}$owner_profile${NC}, but the active profile is ${BOLD}$profile${NC}. Push/pull may fail unless the active account also has access."
             fi
         else
             info "No 'origin' remote found — skipping remote update."
-        fi
-    else
-        info "Not inside a git repo — skipping remote update."
-    fi
-
-    # 4) SSH key (optional — set GIT_SSH_COMMAND)
-    if [[ -n "$ssh_key" ]]; then
-        local expanded_key="${ssh_key/#\~/$HOME}"
-        if [[ -f "$expanded_key" ]]; then
-            git config --global core.sshCommand "ssh -i $expanded_key -o IdentitiesOnly=yes"
-            success "SSH key → ${BOLD}$ssh_key${NC}"
-        else
-            warn "SSH key not found at $ssh_key — skipping."
         fi
     fi
 
@@ -378,8 +569,8 @@ $(echo -e "${BOLD}COMMANDS${NC}")
     switch <profile>    Activate a profile:
                           • Sets git global user.name & user.email
                           • Switches gh CLI auth
-                          • Updates current repo's remote URL
-                          • Configures SSH key (if set)
+                          • Activates a managed SSH alias (if set)
+                          • Updates current repo's origin owner (if inside a repo)
     current             Show the active profile
     help                Show this help message
 

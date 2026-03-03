@@ -1,6 +1,6 @@
 # git-user
 
-A CLI tool to seamlessly switch between multiple Git and GitHub identities. Manage personal, work, and other profiles with a single command that updates your git config, GitHub CLI auth, remote URLs, and SSH keys all at once.
+A CLI tool to seamlessly switch between multiple Git and GitHub identities. Manage personal, work, and other profiles with a single command that updates your git config, GitHub CLI auth, and SSH routing all at once.
 
 ## The Problem
 
@@ -8,10 +8,9 @@ If you use multiple GitHub accounts (personal, work, open-source org), switching
 
 - Change `git config --global user.name` and `user.email`
 - Run `gh auth switch`
-- Update your repo's remote URL to point to the right owner
 - Swap SSH keys
 
-**git-user** does all of this with one command.
+**git-user** handles the global identity switch with one command.
 
 ## Installation
 
@@ -36,7 +35,7 @@ chmod +x /usr/local/bin/git-user
 ```bash
 # 1. Add your profiles
 git-user add personal
-# → prompts for: name, email, GitHub username, SSH key (optional), remote host
+# → prompts for: name, email, GitHub username, org name / repo owner, SSH key (optional), remote host
 
 git-user add work
 
@@ -66,8 +65,8 @@ When you run `git-user switch <profile>`, it performs four actions:
 
 1. **Git config** — Sets `user.name` and `user.email` globally
 2. **GitHub CLI auth** — Runs `gh auth switch` to the profile's account (prompts `gh auth login` if not yet authenticated)
-3. **Remote URL** — If you're inside a git repo, updates the `origin` remote to use the new profile's GitHub username
-4. **SSH key** — If the profile has an SSH key configured, sets `core.sshCommand` to use it
+3. **SSH alias** — If the profile has an SSH key configured, creates or updates a managed SSH host alias and activates global Git URL rewrites so existing `git@github.com:owner/repo.git` remotes use that profile's key. If not, it clears any previous managed SSH routing.
+4. **Remote owner** — If you're inside a git repo and it has an `origin`, updates the owner part to the profile's configured org name or repo owner. This defaults to the profile's GitHub username.
 
 ```
 $ git-user switch work
@@ -76,8 +75,8 @@ $ git-user switch work
 
   ✔ git config → John Smith <john@company.com>
   ✔ gh auth → switched to @john-company
-  ✔ remote origin → https://github.com/john-company/myproject.git
-  ✔ SSH key → ~/.ssh/id_ed25519_work
+  ✔ SSH alias → git-user-work-github-com (~/.ssh/id_ed25519_work)
+  ✔ remote origin → git@github.com:megacorp/company-api.git
 
   ✔ Switched to 'work'
 ```
@@ -91,11 +90,13 @@ All profiles are stored in `~/.git_user.conf` as a simple key-value format:
 personal.name=John Doe
 personal.email=john@gmail.com
 personal.gh_user=johndoe
+personal.org_name=johndoe
 personal.remote_host=github.com
 
 work.name=John Smith
 work.email=john@company.com
 work.gh_user=john-company
+work.org_name=megacorp
 work.ssh_key=~/.ssh/id_ed25519_work
 work.remote_host=github.com
 
@@ -108,9 +109,10 @@ _active=personal
 |---|---|---|
 | `name` | ✔ | Git author name (`user.name`) |
 | `email` | ✔ | Git author email (`user.email`) |
-| `gh_user` | ✔ | GitHub username for `gh` CLI and remote URLs |
-| `ssh_key` | | Path to SSH private key (enables `core.sshCommand`) |
-| `remote_host` | | Git remote hostname (default: `github.com`) |
+| `gh_user` | ✔ | GitHub username for `gh` CLI auth |
+| `org_name` | | Repo owner to use for `origin` updates. Defaults to `gh_user`. |
+| `ssh_key` | | Path to SSH private key used for the managed SSH alias |
+| `remote_host` | | GitHub host for `gh auth` and the SSH alias (default: `github.com`) |
 
 ### Custom Config Location
 
@@ -119,6 +121,13 @@ Override the config path with the `GIT_USER_CONF` environment variable:
 ```bash
 export GIT_USER_CONF="$HOME/.config/git-user/profiles.conf"
 git-user list
+```
+
+Override the SSH config path with `GIT_USER_SSH_CONFIG`:
+
+```bash
+export GIT_USER_SSH_CONFIG="$HOME/.config/ssh/git-user-config"
+git-user switch personal
 ```
 
 ## Examples
@@ -130,6 +139,7 @@ $ git-user add personal
   Full name: John Doe
   Email: john@gmail.com
   GitHub username: johndoe
+  Org name / repo owner [johndoe]:
   SSH key path (optional): ~/.ssh/id_ed25519
   Remote host (optional) [github.com]:
 
@@ -139,6 +149,7 @@ $ git-user add work
   Full name: John Smith
   Email: john.smith@megacorp.com
   GitHub username: john-megacorp
+  Org name / repo owner [john-megacorp]: megacorp
   SSH key path (optional): ~/.ssh/id_ed25519_work
   Remote host (optional) [github.com]:
 
@@ -150,7 +161,7 @@ $ git-user add work
 ```bash
 $ cd ~/projects/company-api
 $ git-user switch work
-# → git config, gh auth, remote URL, and SSH key all updated
+# → git config, gh auth, SSH alias routing, and origin owner all updated
 
 $ git commit -m "feat: add endpoint"
 # commit is authored as John Smith <john.smith@megacorp.com>
@@ -176,6 +187,7 @@ $ git-user add enterprise
   Full name: John Smith
   Email: john@corp.internal
   GitHub username: jsmith
+  Org name / repo owner [jsmith]: engineering
   SSH key path (optional):
   Remote host (optional) [github.com]: github.corp.internal
 
@@ -185,8 +197,7 @@ $ git-user add enterprise
 ## Tips
 
 - **Shell alias** — Add `alias gu="git-user"` to your `.bashrc`/`.zshrc` for faster switching.
-- **Per-repo profiles** — Run `switch` inside a repo to update its remote. Outside a repo, it only updates global git config and gh auth.
-- **Multiple SSH keys** — Each profile can point to a different SSH key. `switch` automatically configures `core.sshCommand` so git uses the right one.
+- **Multiple SSH keys** — Each profile can point to a different SSH key. `switch` manages per-profile SSH host aliases in `~/.ssh/config` and updates Git's global `url.*.insteadOf` rules so standard GitHub SSH remotes follow the active profile.
 - **Edit the config directly** — The `.git_user.conf` file is human-readable; feel free to edit it by hand.
 
 ## License
